@@ -96,6 +96,18 @@ class VideoCompose(BaseTool):
             },
             "input_path": {"type": "string"},
             "output_path": {"type": "string"},
+            "transition": {
+                "type": "string",
+                "enum": ["cut", "crossfade", "fade"],
+                "default": "cut",
+            },
+            "transition_duration": {
+                "type": "number",
+                "minimum": 0.1,
+                "maximum": 5.0,
+                "default": 0.5,
+            },
+
             "edit_decisions": {
                 "type": "object",
                 "description": "Full edit_decisions artifact (required for compose/render)",
@@ -466,11 +478,12 @@ class VideoCompose(BaseTool):
         )
 
     def _compose(self, inputs: dict[str, Any]) -> ToolResult:
-        """FFmpeg composition: concat video cuts, add audio, burn subtitles.
+        """FFmpeg composition: concatenate video and image cuts, add audio, burn subtitles.
 
-        Handles video sources only. Still images and animated scene types
-        are routed to Remotion via the render operation — call compose
-        directly only for pure video pipelines (e.g. talking-head).
+        Supports video and still-image sources through FFmpeg. Still images are
+        rendered as video segments with configurable fit mode, motion, duration,
+        and generated silent audio when required. Animated scene types may still
+        use Remotion via the render operation.
         """
         edit_decisions = inputs.get("edit_decisions")
         if not edit_decisions:
@@ -537,6 +550,7 @@ class VideoCompose(BaseTool):
         temp_segments: list[Path] = []
         concat_path: Path | None = None
         concat_out: Path | None = None
+        transition_out: Path | None = None
 
         try:
             for i, cut in enumerate(cuts):
@@ -551,15 +565,59 @@ class VideoCompose(BaseTool):
                 speed = cut.get("speed", 1.0)
 
                 if self._is_image(source):
-                    return ToolResult(
-                        success=False,
-                        error=(
-                            f"Still image '{source.name}' in cuts. "
-                            "Use operation='render' (auto-routes to Remotion) "
-                            "or operation='remotion_render' for compositions "
-                            "with images, animations, or component scenes."
+                    # Android-friendly still-image rendering.
+                    # Generate a normalized MP4 segment with gentle zoom
+                    # and silent AAC audio for concat compatibility.
+                    if fit_mode == "cover":
+                        image_geom = [
+                            f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase",
+                            f"crop={target_w}:{target_h}",
+                        ]
+                    else:
+                        image_geom = [
+                            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease",
+                            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black",
+                        ]
+
+                    image_vf = ",".join([
+                        *image_geom,
+                        "setsar=1",
+                        (
+                            "zoompan="
+                            "z='min(zoom+0.0005,1.05)':"
+                            "x='iw/2-(iw/zoom/2)':"
+                            "y='ih/2-(ih/zoom/2)':"
+                            "d=1:"
+                            f"s={target_w}x{target_h}:"
+                            "fps=30"
                         ),
-                    )
+                        "fps=30",
+                    ])
+
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-loop", "1",
+                        "-framerate", "30",
+                        "-i", str(source),
+                        "-f", "lavfi",
+                        "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                        "-map", "0:v:0",
+                        "-map", "1:a:0",
+                        "-vf", image_vf,
+                        "-t", str(duration),
+                        "-c:v", codec,
+                        "-crf", str(crf),
+                        "-preset", preset,
+                        "-pix_fmt", "yuv420p",
+                        "-r", "30",
+                        "-c:a", "aac",
+                        "-b:a", "192k",
+                        "-ar", "48000",
+                        "-ac", "2",
+                        str(seg_path),
+                    ]
+                    self.run_command(cmd)
+
                 else:
                     # Video source: trim to segment.
                     #
@@ -665,25 +723,144 @@ class VideoCompose(BaseTool):
 
                 temp_segments.append(seg_path)
 
-            # Step 2: Concat segments
-            concat_path = temp_dir / "concat_list.txt"
-            with open(concat_path, "w", encoding="utf-8") as f:
-                for seg in temp_segments:
-                    safe = str(seg.resolve()).replace("\\", "/")
-                    f.write(f"file '{safe}'\n")
+            # Step 2: Join segments, optionally applying transitions.
+            metadata = edit_decisions.get("metadata") or {}
+            transition = inputs.get(
+                "transition", metadata.get("transition", "cut")
+            )
+            transition_duration = float(inputs.get(
+                "transition_duration",
+                metadata.get("transition_duration", 0.5)
+            ))
 
-            concat_out = temp_dir / "concat.mp4"
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", str(concat_path),
-                "-c", "copy",
-                str(concat_out),
-            ]
-            self.run_command(cmd)
+            if transition not in ("cut", "crossfade", "fade"):
+                return ToolResult(
+                    success=False,
+                    error=f"Unsupported transition: {transition}"
+                )
+
+            if transition_duration <= 0 or transition_duration > 5:
+                return ToolResult(
+                    success=False,
+                    error="transition_duration must be greater than 0 and at most 5 seconds"
+                )
+
+            if transition == "cut" or len(temp_segments) == 1:
+                concat_path = temp_dir / "concat_list.txt"
+                with open(concat_path, "w", encoding="utf-8") as f:
+                    for seg in temp_segments:
+                        safe = str(seg.resolve()).replace("\\", "/")
+                        f.write(f"file '{safe}'\n")
+
+                concat_out = temp_dir / "concat.mp4"
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "concat", "-safe", "0",
+                    "-i", str(concat_path),
+                    "-c", "copy",
+                    str(concat_out),
+                ]
+                self.run_command(cmd)
+                final_input = concat_out
+
+            else:
+                probes = []
+                for seg in temp_segments:
+                    probe_cmd = [
+                        "ffprobe", "-v", "error",
+                        "-show_entries", "format=duration",
+                        "-of", "json", str(seg),
+                    ]
+                    probe = self.run_command(probe_cmd)
+                    probe_data = json.loads(probe.stdout)
+                    duration_value = float(
+                        probe_data.get("format", {}).get("duration", 0)
+                    )
+                    if duration_value <= transition_duration:
+                        return ToolResult(
+                            success=False,
+                            error=(
+                                f"Segment {seg.name} is too short for "
+                                f"a {transition_duration}s transition "
+                                f"(duration: {duration_value:.3f}s)"
+                            )
+                        )
+                    probes.append(duration_value)
+
+                input_args = []
+                filters = []
+
+                for i, seg in enumerate(temp_segments):
+                    input_args.extend(["-i", str(seg)])
+                    filters.append(
+                        f"[{i}:v]settb=AVTB,"
+                        f"setpts=PTS-STARTPTS,"
+                        f"fps=30,format=yuv420p[v{i}]"
+                    )
+                    filters.append(
+                        f"[{i}:a]aresample=48000,"
+                        f"aformat=sample_fmts=fltp:"
+                        f"channel_layouts=stereo,"
+                        f"asetpts=PTS-STARTPTS[a{i}]"
+                    )
+
+                xfade_type = (
+                    "fade" if transition == "crossfade" else "fadeblack"
+                )
+                cumulative_offset = 0.0
+
+                for i in range(len(temp_segments) - 1):
+                    offset = round(
+                        cumulative_offset + probes[i] - transition_duration,
+                        3,
+                    )
+
+                    video_in = "[v0]" if i == 0 else f"[vfade{i-1}]"
+                    audio_in = "[a0]" if i == 0 else f"[afade{i-1}]"
+
+                    video_out = (
+                        f"[vfade{i}]"
+                        if i < len(temp_segments) - 2 else "[vout]"
+                    )
+                    audio_out = (
+                        f"[afade{i}]"
+                        if i < len(temp_segments) - 2 else "[aout]"
+                    )
+
+                    filters.append(
+                        f"{video_in}[v{i+1}]"
+                        f"xfade=transition={xfade_type}:"
+                        f"duration={transition_duration}:"
+                        f"offset={offset}{video_out}"
+                    )
+                    filters.append(
+                        f"{audio_in}[a{i+1}]"
+                        f"acrossfade=d={transition_duration}{audio_out}"
+                    )
+                    cumulative_offset = offset
+
+                transition_out = temp_dir / "transitioned.mp4"
+                cmd = ["ffmpeg", "-y", *input_args]
+                cmd.extend([
+                    "-filter_complex", ";".join(filters),
+                    "-map", "[vout]",
+                    "-map", "[aout]",
+                    "-c:v", codec,
+                    "-crf", str(crf),
+                    "-preset", preset,
+                    "-pix_fmt", "yuv420p",
+                    "-r", "30",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-ar", "48000",
+                    "-ac", "2",
+                    "-movflags", "+faststart",
+                    str(transition_out),
+                ])
+                self.run_command(cmd)
+                final_input = transition_out
 
             # Step 3: Apply subtitles and/or replace audio
-            final_input = concat_out
             vfilters = []
 
             if subtitle_path and Path(subtitle_path).exists():
@@ -747,7 +924,7 @@ class VideoCompose(BaseTool):
             for f in temp_segments:
                 if f.exists():
                     f.unlink()
-            for f in [concat_path, concat_out]:
+            for f in [concat_path, concat_out, transition_out]:
                 if f is not None and f.exists():
                     f.unlink()
             if temp_dir.exists():
